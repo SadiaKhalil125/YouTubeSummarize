@@ -2,12 +2,10 @@ import os
 from serpapi import GoogleSearch
 from dotenv import load_dotenv
 import google.generativeai as genai
-# Pytube is no longer needed for downloading, but we'll leave the import for context
-# from pytube import YouTube 
 from pydub import AudioSegment
 import time
 import logging
-import subprocess # Import the subprocess module
+import subprocess 
 import streamlit as st
 
 # --- Setup Logging ---
@@ -23,7 +21,7 @@ with st.sidebar:
     st.header("API Configuration")
     st.markdown("Please enter your API keys below.")
     load_dotenv()
-    # For demonstration, allowing manual input if .env fails
+    
     serpapi_key = os.getenv("SERPAPI_API_KEY")
     gemini_key = os.getenv("GEMINI_API_KEY")
 
@@ -34,7 +32,7 @@ with st.sidebar:
 
 # --- Core Functions ---
 def get_video_url(query: str, api_key: str) -> str:
-    # This function remains the same
+    """Search for a YouTube video using SerpAPI."""
     params = {
         "engine": "youtube",
         "search_query": query,
@@ -52,91 +50,112 @@ def get_video_url(query: str, api_key: str) -> str:
         logging.error(f"SerpApi Error: {e}")
         return None
 
-# --- REVISED transcribe_video FUNCTION ---
 def transcribe_video(video_url: str) -> str:
-    """Downloads audio with yt-dlp, converts it, and returns the transcription from Gemini."""
+    """Downloads audio with yt-dlp and transcribes with Gemini."""
     downloaded_file_path = None
     converted_file_path = None
     try:
-        # 1. Download Audio using yt-dlp
-        st.info("Downloading audio from YouTube using yt-dlp...")
+        st.info("Downloading audio from YouTube...")
         
-        # Define the output file name, yt-dlp will add the correct extension
         output_template = "temp_audio.%(ext)s"
         
-        # Command to execute yt-dlp
-        # -x: extract audio
-        # --audio-format best: get the best quality audio
-        # -o: specify output file template
+        # Enhanced command with cookies and user agent to bypass 403
         command = [
             "yt-dlp",
-            "-x",
-            "--audio-format", "best",
+            "-f", "bestaudio/best",  # Changed format selector
+            "-x",  # Extract audio
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
             "-o", output_template,
+            "--no-playlist",
+            "--extractor-args", "youtube:player_client=android",  # Use Android client
+            "--no-check-certificate",
             video_url
         ]
         
-        # Execute the command
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        logging.info(f"Running: {' '.join(command)}")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
         
-        # Find the actual name of the downloaded file (since extension was unknown)
-        # We need to find the file that starts with 'temp_audio'
-        temp_dir_files = os.listdir('.')
-        downloaded_file_path = next((f for f in temp_dir_files if f.startswith('temp_audio')), None)
-
-        if not downloaded_file_path or not os.path.exists(downloaded_file_path) or os.path.getsize(downloaded_file_path) == 0:
-            st.error("Audio download with yt-dlp failed. Could not find downloaded file or file is empty.")
-            logging.error(f"yt-dlp stdout: {result.stdout}")
-            logging.error(f"yt-dlp stderr: {result.stderr}")
+        if result.returncode != 0:
+            st.error("yt-dlp download failed. See error details below.")
+            with st.expander("Show yt-dlp error"):
+                st.code(result.stderr if result.stderr else result.stdout)
+            
+            # Show helpful message
+            st.warning("⚠️ YouTube is blocking the download. Try these solutions:")
+            st.markdown("""
+            1. **Update yt-dlp**: Run `pip install --upgrade yt-dlp`
+            2. **Try a different video**: Some videos have stricter protections
+            3. **Wait a few minutes**: You may be temporarily rate-limited
+            4. **Use a VPN**: Your IP might be blocked by YouTube
+            """)
             return None
-        st.success(f"✅ Audio downloaded successfully: {downloaded_file_path}")
-
-        # 2. Convert Audio
-        st.info("Converting audio to a compatible format (FLAC)...")
+        
+        # Find downloaded file
+        temp_files = [f for f in os.listdir('.') if f.startswith('temp_audio')]
+        if not temp_files:
+            st.error("Audio file not found after download.")
+            return None
+        
+        downloaded_file_path = temp_files[0]
+        st.success(f"Audio downloaded: {downloaded_file_path} ({os.path.getsize(downloaded_file_path):,} bytes)")
+        
+        # Convert audio
+        st.info("Converting audio to FLAC format...")
         audio = AudioSegment.from_file(downloaded_file_path)
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         converted_file_path = "converted_audio.flac"
         audio.export(converted_file_path, format="flac")
+        st.success(f"Audio converted: {os.path.getsize(converted_file_path):,} bytes")
         
-        if not os.path.exists(converted_file_path) or os.path.getsize(converted_file_path) == 0:
-            st.error("Audio conversion failed, resulting in an empty file.")
-            return None
-        st.success("✅ Audio converted successfully.")
-
-        # 3. Transcribe with Gemini (This part remains the same)
-        st.info("Uploading audio to Gemini for transcription...")
+        # Upload to Gemini
+        st.info("Uploading audio to Gemini...")
         your_file = genai.upload_file(path=converted_file_path, display_name="youtube_audio")
         
-        st.info("Processing the audio file...")
-        while your_file.state.name == "PROCESSING":
+        # Wait for processing
+        st.info("Processing audio file...")
+        max_wait = 300
+        waited = 0
+        while your_file.state.name == "PROCESSING" and waited < max_wait:
             time.sleep(2)
+            waited += 2
             your_file = genai.get_file(name=your_file.name)
         
         if your_file.state.name == "FAILED":
-            st.error("Gemini file processing failed. The file may be corrupt or in an unsupported format.")
+            st.error("Gemini failed to process the audio file.")
+            genai.delete_file(your_file.name)
             return None
         
-        st.info("Transcribing the audio...")
+        # Transcribe
+        st.info("Transcribing audio with Gemini...")
         model = genai.GenerativeModel(model_name='models/gemini-2.5-flash')
-        response = model.generate_content(["Transcribe the following audio:", your_file])
+        response = model.generate_content([
+            "Transcribe the following audio completely and accurately. Include all spoken words:",
+            your_file
+        ])
         
         genai.delete_file(your_file.name)
         return response.text
 
-    except subprocess.CalledProcessError as e:
-        st.error(f"yt-dlp failed to download the audio. This can happen with private or age-restricted videos.")
-        logging.error(f"yt-dlp error: {e.stderr}")
+    except subprocess.TimeoutExpired:
+        st.error("Download timed out after 5 minutes.")
         return None
     except Exception as e:
-        st.error(f"An error occurred during the transcription process: {e}")
-        logging.error(f"An error occurred during transcription: {e}", exc_info=True)
+        st.error(f"Error during transcription: {str(e)}")
+        logging.error(f"Transcription error: {e}", exc_info=True)
         return None
     finally:
-        # 4. Cleanup local files
+        # Cleanup
         if downloaded_file_path and os.path.exists(downloaded_file_path):
-            os.remove(downloaded_file_path)
+            try:
+                os.remove(downloaded_file_path)
+            except:
+                pass
         if converted_file_path and os.path.exists(converted_file_path):
-            os.remove(converted_file_path)
+            try:
+                os.remove(converted_file_path)
+            except:
+                pass
 
 def save_transcription(topic: str, transcript: str):
     """Saves the transcription to a text file."""
@@ -156,23 +175,23 @@ if st.button("Search and Transcribe", use_container_width=True):
     else:
         genai.configure(api_key=gemini_key)
         with st.status("Running the AI agent...", expanded=True) as status:
-            st.write(f"➡️ Searching for a video about '{topic}'...")
+            st.write(f"Searching for a video about '{topic}'...")
             video_url = get_video_url(topic, serpapi_key)
             if video_url:
-                st.write(f"✅ Video found: {video_url}")
+                st.write(f"Video found: {video_url}")
                 st.video(video_url)
-                st.write("➡️ Starting transcription process...")
+                st.write("Starting transcription process...")
                 transcript = transcribe_video(video_url)
                 if transcript:
-                    st.write("✅ Transcription successful.")
+                    st.write("Transcription successful!")
                     saved_file = save_transcription(topic, transcript)
-                    st.write(f"💾 Transcription saved to file: **{saved_file}**")
+                    st.write(f"💾 Transcription saved to: **{saved_file}**")
                     st.subheader("Generated Transcript")
                     st.text_area("Transcript", transcript, height=400)
                     status.update(label="Process Complete!", state="complete")
                 else:
-                    st.error("Could not generate transcript. Please check the logs for errors.")
+                    st.error("Could not generate transcript.")
                     status.update(label="Process Failed", state="error")
             else:
-                st.error(f"No video was found for the topic: '{topic}'")
+                st.error(f"No video found for: '{topic}'")
                 status.update(label="Process Failed", state="error")
